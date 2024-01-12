@@ -30,11 +30,21 @@ async function reset(account: string): Promise<void> {
 async function charge(account: string, charges: number): Promise<ChargeResult> {
     const client = await connect();
     try {
-        const balance = parseInt((await client.get(`${account}/balance`)) ?? "");
+        
+        const balanceKey = `${account}/balance`;
+        await client.watch(balanceKey)
+        const balance = parseInt((await client.get(balanceKey)) ?? "");
         if (balance >= charges) {
-            await client.set(`${account}/balance`, balance - charges);
-            const remainingBalance = parseInt((await client.get(`${account}/balance`)) ?? "");
-            return { isAuthorized: true, remainingBalance, charges };
+            const multi=client.multi()
+            multi.set(`${account}/balance`, balance - charges);
+            const execResult = await multi.exec();
+            if(execResult){
+                const remainingBalance = parseInt((await client.get(balanceKey)) ?? "");
+                return { isAuthorized: true, remainingBalance, charges };
+            }else{
+                const remainingBalance = parseInt((await client.get(balanceKey)) ?? "");
+                return {isAuthorized:false, remainingBalance, charges:0};
+            }
         } else {
             return { isAuthorized: false, remainingBalance: balance, charges: 0 };
         }
