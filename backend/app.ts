@@ -1,6 +1,7 @@
 import express from "express";
-import { createClient } from "redis";
+import { createClient, defineScript , RedisClientType, RedisFunctions, RedisModules, RedisScripts} from "redis";
 import { json } from "body-parser";
+
 
 const DEFAULT_BALANCE = 100;
 
@@ -10,11 +11,43 @@ interface ChargeResult {
     charges: number;
 }
 
-async function connect(): Promise<ReturnType<typeof createClient>> {
+interface ExtendedRedisClientType extends RedisClientType<RedisModules, RedisFunctions, RedisScripts> {
+    conditionalSet: (account: string, charges: number) => Promise<{ isAuthorized: boolean; remainingBalance: number }>;
+}
+
+  
+async function connect(): Promise<ExtendedRedisClientType> {
     const url = `redis://${process.env.REDIS_HOST ?? "localhost"}:${process.env.REDIS_PORT ?? "6379"}`;
     console.log(`Using redis URL ${url}`);
-    const client = createClient({ url });
+    const client = createClient({
+        url,
+        scripts: {
+          conditionalSet: defineScript({
+            NUMBER_OF_KEYS: 1,
+            SCRIPT: `
+              local balance = tonumber(redis.call('GET', KEYS[1]))
+              if balance and balance >= tonumber(ARGV[1]) then
+                  balance = balance - tonumber(ARGV[1])
+                  redis.call('SET', KEYS[1], tostring(balance))
+                  return {true, balance}
+              else
+                  return {false, balance or 0}
+              end
+            `,
+            transformArguments(account: string, charges: number): Array<string> {
+              return [`${account}/balance`, charges.toString()];
+            },
+            transformReply(reply: [boolean, number]): { isAuthorized: boolean; remainingBalance: number } {
+              return {
+                isAuthorized: reply[0],
+                remainingBalance: reply[1]
+              };
+            }
+          })
+        }
+      }) as ExtendedRedisClientType;
     await client.connect();
+    
     return client;
 }
 
@@ -27,17 +60,17 @@ async function reset(account: string): Promise<void> {
     }
 }
 
+
 async function charge(account: string, charges: number): Promise<ChargeResult> {
     const client = await connect();
     try {
-        const balance = parseInt((await client.get(`${account}/balance`)) ?? "");
-        if (balance >= charges) {
-            await client.set(`${account}/balance`, balance - charges);
-            const remainingBalance = parseInt((await client.get(`${account}/balance`)) ?? "");
-            return { isAuthorized: true, remainingBalance, charges };
-        } else {
-            return { isAuthorized: false, remainingBalance: balance, charges: 0 };
-        }
+        const {isAuthorized, remainingBalance} = await client.conditionalSet(account, charges);
+
+        return {
+            isAuthorized: isAuthorized,
+            remainingBalance: remainingBalance,
+            charges: isAuthorized ? charges : 0
+        };
     } finally {
         await client.disconnect();
     }
